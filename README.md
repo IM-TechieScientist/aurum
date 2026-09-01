@@ -76,6 +76,15 @@ curl -fsS -X POST localhost:8080/api/v1/transfers \
   -d "{\"sourceAccountId\":\"$alice\",\"destinationAccountId\":\"$bob\",\"amountMinor\":25000,\"currency\":\"INR\",\"reference\":\"demo transfer\"}"
 ```
 
+Withdraw INR 100.00 from Bob:
+
+```bash
+curl -fsS -X POST "localhost:8080/api/v1/accounts/$bob/withdraw" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: withdraw-bob-001' \
+  -d '{"amountMinor":10000,"currency":"INR","reference":"demo withdrawal"}'
+```
+
 Repeating the exact transfer request with the same key returns the original transaction
 and does not move money again. Reusing the key with a different payload returns HTTP 409.
 
@@ -101,7 +110,8 @@ POST  /api/v1/transactions/{transactionId}/reversal
 
 Customer accounts are liabilities with a normal credit balance. Aurum seeds one debit-normal
 settlement asset account for INR and USD. Funding debits settlement and credits the customer;
-a transfer debits the source customer and credits the destination customer.
+a transfer debits the source customer and credits the destination customer; a withdrawal
+debits the customer and credits settlement.
 
 `account_balance` is a transactionally updated projection. `ledger_entry` remains the source
 of truth. `GET /api/v1/reconciliation` recomputes balances and reports any mismatch.

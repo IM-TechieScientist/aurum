@@ -69,6 +69,40 @@ public class LedgerService {
     }
 
     @Transactional
+    public TransactionView withdraw(UUID accountId, long amountMinor, String requestedCurrency,
+                                    String reference, String idempotencyKey) {
+        String currency = normalizeCurrency(requestedCurrency);
+        String scope = "withdraw:" + accountId;
+        String hash = RequestHash.sha256(accountId + "|" + amountMinor + "|" + currency + "|" + safe(reference));
+        Instant now = Instant.now(clock);
+        IdempotencyService.Claim claim = idempotency.claim(scope, idempotencyKey, hash, now);
+        if (!claim.owned()) {
+            return requiredTransaction(claim.transactionId());
+        }
+
+        AccountView source = requiredAccount(accountId);
+        requireCustomerAccount(source);
+        requireCurrency(source, currency);
+        AccountView settlement = accounts.findSettlement(currency).orElseThrow(() ->
+                new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "UNSUPPORTED_CURRENCY",
+                        "No settlement account exists for this currency"));
+
+        Map<UUID, AccountView> locked = posting.lockAccounts(List.of(source.id(), settlement.id()));
+        source = locked.get(source.id());
+        if (source.status() != AccountStatus.ACTIVE) {
+            throw new ApiException(HttpStatus.CONFLICT, "ACCOUNT_FROZEN",
+                    "A frozen account cannot withdraw funds");
+        }
+
+        TransactionView result = posting.post(TransactionType.WITHDRAWAL, reference, null, List.of(
+                new LedgerEntryDraft(source.id(), EntryDirection.DEBIT, amountMinor, currency),
+                new LedgerEntryDraft(settlement.id(), EntryDirection.CREDIT, amountMinor, currency)
+        ), locked, now);
+        idempotency.complete(scope, idempotencyKey, result.id());
+        return result;
+    }
+
+    @Transactional
     public TransactionView transfer(UUID sourceAccountId, UUID destinationAccountId,
                                     long amountMinor, String requestedCurrency,
                                     String reference, String idempotencyKey) {
@@ -190,4 +224,3 @@ public class LedgerService {
                 "The transaction has already been reversed");
     }
 }
-

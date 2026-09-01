@@ -43,6 +43,15 @@ public class LedgerController {
                 request.reference(), idempotencyKey);
     }
 
+    @PostMapping("/accounts/{accountId}/withdraw")
+    @ResponseStatus(HttpStatus.CREATED)
+    TransactionView withdraw(@PathVariable UUID accountId,
+                             @RequestHeader("Idempotency-Key") String idempotencyKey,
+                             @Valid @RequestBody WithdrawalRequest request) {
+        return ledger.withdraw(accountId, request.amountMinor(), request.currency(),
+                request.reference(), idempotencyKey);
+    }
+
     @PostMapping("/transfers")
     @ResponseStatus(HttpStatus.CREATED)
     TransactionView transfer(@RequestHeader("Idempotency-Key") String idempotencyKey,
@@ -78,6 +87,13 @@ public class LedgerController {
     ) {
     }
 
+    public record WithdrawalRequest(
+            @Min(1) @Max(MAX_AMOUNT_MINOR) long amountMinor,
+            @NotBlank @Pattern(regexp = "^[A-Za-z]{3}$") String currency,
+            @Size(max = 200) String reference
+    ) {
+    }
+
     public record TransferRequest(
             @NotNull UUID sourceAccountId,
             @NotNull UUID destinationAccountId,
@@ -90,4 +106,3 @@ public class LedgerController {
     public record ReversalRequest(@NotBlank @Size(max = 200) String reason) {
     }
 }
-

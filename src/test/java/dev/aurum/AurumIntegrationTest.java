@@ -99,6 +99,67 @@ class AurumIntegrationTest {
     }
 
     @Test
+    void withdrawalIsBalancedAndIdempotent() {
+        AccountView account = account("Withdrawal account", "INR");
+        ledger.fund(account.id(), 10_000, "INR", "initial funding", key());
+        String idempotencyKey = key();
+
+        TransactionView first = ledger.withdraw(account.id(), 2_500, "INR",
+                "cash withdrawal", idempotencyKey);
+        TransactionView replay = ledger.withdraw(account.id(), 2_500, "INR",
+                "cash withdrawal", idempotencyKey);
+
+        assertThat(first.type().name()).isEqualTo("WITHDRAWAL");
+        assertThat(replay.id()).isEqualTo(first.id());
+        assertThat(first.entries()).hasSize(2);
+        assertThat(sum(first, "DEBIT")).isEqualTo(2_500);
+        assertThat(sum(first, "CREDIT")).isEqualTo(2_500);
+        assertThat(accounts.get(account.id()).balanceMinor()).isEqualTo(7_500);
+        assertThat(jdbc.queryForObject("""
+                SELECT COUNT(*) FROM ledger_transaction WHERE transaction_type = 'WITHDRAWAL' AND id = ?
+                """, Long.class, first.id())).isEqualTo(1);
+    }
+
+    @Test
+    void insufficientWithdrawalRollsBackEverything() {
+        AccountView account = account("Insufficient withdrawal", "INR");
+        ledger.fund(account.id(), 500, "INR", null, key());
+        String idempotencyKey = key();
+        long transactionCountBefore = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM ledger_transaction", Long.class);
+
+        assertThatThrownBy(() -> ledger.withdraw(
+                account.id(), 600, "INR", null, idempotencyKey))
+                .isInstanceOfSatisfying(ApiException.class,
+                        exception -> assertThat(exception.code()).isEqualTo("INSUFFICIENT_FUNDS"));
+
+        assertThat(accounts.get(account.id()).balanceMinor()).isEqualTo(500);
+        assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM ledger_transaction", Long.class))
+                .isEqualTo(transactionCountBefore);
+        assertThat(jdbc.queryForObject("""
+                SELECT COUNT(*) FROM idempotency_record
+                 WHERE scope = ? AND idempotency_key = ?
+                """, Long.class, "withdraw:" + account.id(), idempotencyKey)).isZero();
+    }
+
+    @Test
+    void withdrawalRejectsFrozenAccountAndCurrencyMismatch() {
+        AccountView account = account("Restricted withdrawal", "USD");
+        ledger.fund(account.id(), 500, "USD", null, key());
+        accounts.changeStatus(account.id(), AccountStatus.FROZEN);
+
+        assertThatThrownBy(() -> ledger.withdraw(account.id(), 100, "USD", null, key()))
+                .isInstanceOfSatisfying(ApiException.class,
+                        exception -> assertThat(exception.code()).isEqualTo("ACCOUNT_FROZEN"));
+
+        accounts.changeStatus(account.id(), AccountStatus.ACTIVE);
+        assertThatThrownBy(() -> ledger.withdraw(account.id(), 100, "INR", null, key()))
+                .isInstanceOfSatisfying(ApiException.class,
+                        exception -> assertThat(exception.code()).isEqualTo("CURRENCY_MISMATCH"));
+        assertThat(accounts.get(account.id()).balanceMinor()).isEqualTo(500);
+    }
+
+    @Test
     void reversalCompensatesWithoutChangingOriginalEntries() {
         AccountView source = account("Reverse source", "INR");
         AccountView destination = account("Reverse destination", "INR");
