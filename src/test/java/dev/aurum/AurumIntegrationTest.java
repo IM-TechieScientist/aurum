@@ -1,20 +1,33 @@
 package dev.aurum;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.aurum.account.AccountService;
 import dev.aurum.account.AccountStatus;
 import dev.aurum.account.AccountView;
 import dev.aurum.common.ApiException;
 import dev.aurum.ledger.LedgerService;
+import dev.aurum.ledger.TransactionSummary;
 import dev.aurum.ledger.TransactionView;
+import dev.aurum.reconciliation.ReconciliationJob;
+import dev.aurum.reconciliation.ReconciliationRunService;
+import dev.aurum.reconciliation.ReconciliationRunView;
+import dev.aurum.reconciliation.ReconciliationService;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.http.MediaType;
+import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.transaction.TransactionSystemException;
 import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.test.web.servlet.MockMvc;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -28,11 +41,19 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.httpBasic;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 @SpringBootTest
+@AutoConfigureMockMvc
 @Testcontainers
 class AurumIntegrationTest {
 
@@ -60,6 +81,24 @@ class AurumIntegrationTest {
 
     @Autowired
     TransactionTemplate transactions;
+
+    @Autowired
+    ReconciliationService reconciliation;
+
+    @Autowired
+    ReconciliationJob reconciliationJob;
+
+    @Autowired
+    ReconciliationRunService reconciliationRuns;
+
+    @Autowired
+    MockMvc mockMvc;
+
+    @Autowired
+    ObjectMapper objectMapper;
+
+    @Autowired
+    MeterRegistry meterRegistry;
 
     @Test
     void transferIsBalancedAndIdempotent() {
@@ -144,6 +183,231 @@ class AurumIntegrationTest {
                 .isInstanceOfSatisfying(ApiException.class,
                         exception -> assertThat(exception.code()).isEqualTo("IDEMPOTENCY_CONFLICT"));
         assertThat(accounts.get(source.id()).balanceMinor()).isEqualTo(900);
+        assertThat(accounts.get(destination.id()).balanceMinor()).isEqualTo(100);
+    }
+
+    @Test
+    void projectionRebuildRepairsOnlyLedgerMismatches() throws Exception {
+        AccountView account = account("Projection rebuild", "INR");
+        ledger.fund(account.id(), 750, "INR", null, key());
+        jdbc.update("UPDATE account_balance SET balance_minor = 13 WHERE account_id = ?", account.id());
+
+        ReconciliationService.ReconciliationResult before = reconciliation.reconcile();
+        assertThat(before.consistent()).isFalse();
+        assertThat(before.mismatches()).anySatisfy(mismatch -> {
+            assertThat(mismatch.accountId()).isEqualTo(account.id());
+            assertThat(mismatch.projectedBalanceMinor()).isEqualTo(13);
+            assertThat(mismatch.ledgerBalanceMinor()).isEqualTo(750);
+        });
+
+        mockMvc.perform(post("/api/v1/reconciliation/rebuild")
+                        .with(httpBasic("operator", "operator-local")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.repairedAccounts").value(1))
+                .andExpect(jsonPath("$.repairs[0].accountId").value(account.id().toString()))
+                .andExpect(jsonPath("$.repairs[0].previousBalanceMinor").value(13))
+                .andExpect(jsonPath("$.repairs[0].rebuiltBalanceMinor").value(750));
+
+        assertThat(accounts.get(account.id()).balanceMinor()).isEqualTo(750);
+        assertThat(reconciliation.reconcile().consistent()).isTrue();
+    }
+
+    @Test
+    void httpTransferContractSupportsReplayAndExposesMetrics() throws Exception {
+        AccountView source = account("HTTP source", "INR");
+        AccountView destination = account("HTTP destination", "INR");
+        ledger.fund(source.id(), 1_000, "INR", null, key());
+        String idempotencyKey = key();
+        String request = """
+                {"sourceAccountId":"%s","destinationAccountId":"%s",
+                 "amountMinor":250,"currency":"INR","reference":"http contract"}
+                """.formatted(source.id(), destination.id());
+        double transferSuccessBefore = counter("aurum.transfer.operations", "outcome", "success");
+        double replayBefore = counter("aurum.idempotency.requests", "outcome", "replayed");
+
+        String firstBody = mockMvc.perform(post("/api/v1/transfers")
+                        .with(httpBasic("customer", "customer-local"))
+                        .header("Idempotency-Key", idempotencyKey)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(request))
+                .andExpect(status().isCreated())
+                .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_JSON))
+                .andExpect(jsonPath("$.type").value("TRANSFER"))
+                .andExpect(jsonPath("$.entries.length()").value(2))
+                .andReturn().getResponse().getContentAsString();
+        JsonNode first = objectMapper.readTree(firstBody);
+
+        mockMvc.perform(post("/api/v1/transfers")
+                        .with(httpBasic("customer", "customer-local"))
+                        .header("Idempotency-Key", idempotencyKey)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(request))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.id").value(first.get("id").asText()));
+
+        assertThat(accounts.get(source.id()).balanceMinor()).isEqualTo(750);
+        assertThat(accounts.get(destination.id()).balanceMinor()).isEqualTo(250);
+        assertThat(counter("aurum.transfer.operations", "outcome", "success"))
+                .isEqualTo(transferSuccessBefore + 2);
+        assertThat(counter("aurum.idempotency.requests", "outcome", "replayed"))
+                .isEqualTo(replayBefore + 1);
+
+        mockMvc.perform(get("/actuator/metrics/aurum.transfer.operations")
+                        .with(httpBasic("auditor", "auditor-local")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.name").value("aurum.transfer.operations"));
+    }
+
+    @Test
+    void rbacRequiresAuthenticationAndEnforcesOperatorBoundaries() throws Exception {
+        mockMvc.perform(get("/actuator/health"))
+                .andExpect(status().isOk());
+
+        mockMvc.perform(post("/api/v1/reconciliation/rebuild"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.code").value("AUTHENTICATION_REQUIRED"));
+
+        mockMvc.perform(post("/api/v1/reconciliation/rebuild")
+                        .with(httpBasic("customer", "customer-local")))
+                .andExpect(status().isForbidden())
+                .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.code").value("ACCESS_DENIED"));
+
+        mockMvc.perform(get("/api/v1/reconciliation")
+                        .with(httpBasic("auditor", "auditor-local")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.consistent").value(true));
+    }
+
+    @Test
+    void scheduledReconciliationPersistsReportsAndMetrics() throws Exception {
+        double consistentBefore = counter("aurum.reconciliation.runs", "outcome", "consistent");
+        double mismatchedBefore = counter("aurum.reconciliation.runs", "outcome", "mismatched");
+
+        ReconciliationRunService.RunAttempt consistentAttempt = reconciliationJob.runOnce();
+        assertThat(consistentAttempt.executed()).isTrue();
+        assertThat(consistentAttempt.run().status()).isEqualTo(ReconciliationRunView.Status.CONSISTENT);
+        assertThat(consistentAttempt.run().mismatchCount()).isZero();
+
+        AccountView account = account("Scheduled reconciliation", "INR");
+        ledger.fund(account.id(), 900, "INR", null, key());
+        jdbc.update("UPDATE account_balance SET balance_minor = 12 WHERE account_id = ?", account.id());
+
+        ReconciliationRunService.RunAttempt mismatchedAttempt = reconciliationJob.runOnce();
+        assertThat(mismatchedAttempt.executed()).isTrue();
+        assertThat(mismatchedAttempt.run().status()).isEqualTo(ReconciliationRunView.Status.MISMATCHED);
+        assertThat(mismatchedAttempt.run().mismatches()).singleElement().satisfies(mismatch -> {
+            assertThat(mismatch.accountId()).isEqualTo(account.id());
+            assertThat(mismatch.projectedBalanceMinor()).isEqualTo(12);
+            assertThat(mismatch.ledgerBalanceMinor()).isEqualTo(900);
+        });
+        assertThat(reconciliationRuns.recent(20))
+                .extracting(ReconciliationRunView::id)
+                .contains(consistentAttempt.run().id(), mismatchedAttempt.run().id());
+        assertThatThrownBy(() -> jdbc.update(
+                "UPDATE reconciliation_run SET mismatch_count = 0 WHERE id = ?",
+                mismatchedAttempt.run().id()))
+                .isInstanceOf(DataAccessException.class);
+        assertThatThrownBy(() -> jdbc.update(
+                "DELETE FROM reconciliation_run_mismatch WHERE run_id = ?",
+                mismatchedAttempt.run().id()))
+                .isInstanceOf(DataAccessException.class);
+
+        String historyBody = mockMvc.perform(get("/api/v1/reconciliation/runs?limit=20")
+                        .with(httpBasic("auditor", "auditor-local")))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        JsonNode history = objectMapper.readTree(historyBody);
+        assertThat(history.findValuesAsText("id"))
+                .contains(consistentAttempt.run().id().toString(), mismatchedAttempt.run().id().toString());
+
+        mockMvc.perform(get("/api/v1/reconciliation/runs")
+                        .with(httpBasic("customer", "customer-local")))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.code").value("ACCESS_DENIED"));
+
+        assertThat(counter("aurum.reconciliation.runs", "outcome", "consistent"))
+                .isEqualTo(consistentBefore + 1);
+        assertThat(counter("aurum.reconciliation.runs", "outcome", "mismatched"))
+                .isEqualTo(mismatchedBefore + 1);
+        assertThat(gauge("aurum.reconciliation.last.mismatches")).isEqualTo(1);
+
+        reconciliation.rebuild();
+        assertThat(reconciliation.reconcile().consistent()).isTrue();
+    }
+
+    @Test
+    void scheduledReconciliationSkipsWhenAnotherInstanceHoldsTheLock() throws Exception {
+        CountDownLatch lockHeld = new CountDownLatch(1);
+        CountDownLatch releaseLock = new CountDownLatch(1);
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        Future<?> holder = executor.submit(() -> transactions.executeWithoutResult(status -> {
+            jdbc.query("SELECT pg_advisory_xact_lock(?)", resultSet -> null,
+                    ReconciliationRunService.ADVISORY_LOCK_KEY);
+            lockHeld.countDown();
+            try {
+                releaseLock.await();
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted while holding reconciliation lock", exception);
+            }
+        }));
+
+        try {
+            lockHeld.await();
+            double skippedBefore = counter("aurum.reconciliation.runs", "outcome", "skipped");
+            ReconciliationRunService.RunAttempt attempt = reconciliationJob.runOnce();
+            assertThat(attempt.executed()).isFalse();
+            assertThat(attempt.run()).isNull();
+            assertThat(counter("aurum.reconciliation.runs", "outcome", "skipped"))
+                    .isEqualTo(skippedBefore + 1);
+        } finally {
+            releaseLock.countDown();
+            holder.get();
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void httpValidationAndIdempotencyConflictsUseProblemDetails() throws Exception {
+        AccountView source = account("HTTP error source", "USD");
+        AccountView destination = account("HTTP error destination", "USD");
+        ledger.fund(source.id(), 500, "USD", null, key());
+        String idempotencyKey = key();
+        String validRequest = """
+                {"sourceAccountId":"%s","destinationAccountId":"%s",
+                 "amountMinor":100,"currency":"USD"}
+                """.formatted(source.id(), destination.id());
+
+        mockMvc.perform(post("/api/v1/transfers")
+                        .with(httpBasic("customer", "customer-local"))
+                        .header("Idempotency-Key", key())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(validRequest.replace("\"amountMinor\":100", "\"amountMinor\":0")))
+                .andExpect(status().isBadRequest())
+                .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.errors.amountMinor").exists());
+
+        mockMvc.perform(post("/api/v1/transfers")
+                        .with(httpBasic("customer", "customer-local"))
+                        .header("Idempotency-Key", idempotencyKey)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(validRequest))
+                .andExpect(status().isCreated());
+
+        mockMvc.perform(post("/api/v1/transfers")
+                        .with(httpBasic("customer", "customer-local"))
+                        .header("Idempotency-Key", idempotencyKey)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(validRequest.replace("\"amountMinor\":100", "\"amountMinor\":200")))
+                .andExpect(status().isConflict())
+                .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.title").value("IDEMPOTENCY_CONFLICT"))
+                .andExpect(jsonPath("$.code").value("IDEMPOTENCY_CONFLICT"));
+
+        assertThat(accounts.get(source.id()).balanceMinor()).isEqualTo(400);
         assertThat(accounts.get(destination.id()).balanceMinor()).isEqualTo(100);
     }
 
@@ -287,6 +551,27 @@ class AurumIntegrationTest {
     }
 
     @Test
+    void accountHistoryUsesStableKeysetPagination() {
+        AccountView source = account("History source", "INR");
+        AccountView destination = account("History destination", "INR");
+        ledger.fund(source.id(), 1_000, "INR", "history funding", key());
+        ledger.transfer(source.id(), destination.id(), 100, "INR", "history one", key());
+        ledger.transfer(source.id(), destination.id(), 100, "INR", "history two", key());
+        ledger.transfer(source.id(), destination.id(), 100, "INR", "history three", key());
+
+        List<TransactionSummary> complete = ledger.history(source.id(), null, 10);
+        List<TransactionSummary> firstPage = ledger.history(source.id(), null, 2);
+        List<TransactionSummary> secondPage = ledger.history(
+                source.id(), firstPage.getLast().id(), 2);
+
+        assertThat(complete).hasSize(4);
+        assertThat(firstPage).hasSize(2);
+        assertThat(secondPage).hasSize(2);
+        assertThat(Stream.concat(firstPage.stream(), secondPage.stream()).map(TransactionSummary::id))
+                .containsExactlyElementsOf(complete.stream().map(TransactionSummary::id).toList());
+    }
+
+    @Test
     void databaseRejectsUnbalancedAndMutableLedgerData() {
         UUID invalidTransactionId = UUID.randomUUID();
         UUID sourceId = account("Constraint source", "INR").id();
@@ -334,5 +619,15 @@ class AurumIntegrationTest {
 
     private String key() {
         return UUID.randomUUID().toString();
+    }
+
+    private double counter(String name, String tagName, String tagValue) {
+        Counter counter = meterRegistry.find(name).tag(tagName, tagValue).counter();
+        return counter == null ? 0 : counter.count();
+    }
+
+    private double gauge(String name) {
+        Gauge gauge = meterRegistry.find(name).gauge();
+        return gauge == null ? 0 : gauge.value();
     }
 }

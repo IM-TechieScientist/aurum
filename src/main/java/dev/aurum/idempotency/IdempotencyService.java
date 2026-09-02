@@ -1,6 +1,7 @@
 package dev.aurum.idempotency;
 
 import dev.aurum.common.ApiException;
+import dev.aurum.observability.AurumMetrics;
 import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -14,9 +15,11 @@ import java.util.UUID;
 public class IdempotencyService {
 
     private final JdbcTemplate jdbc;
+    private final AurumMetrics metrics;
 
-    public IdempotencyService(JdbcTemplate jdbc) {
+    public IdempotencyService(JdbcTemplate jdbc, AurumMetrics metrics) {
         this.jdbc = jdbc;
+        this.metrics = metrics;
     }
 
     public Claim claim(String scope, String key, String requestHash, Instant now) {
@@ -29,6 +32,7 @@ public class IdempotencyService {
                 """, scope, key, requestHash, Timestamp.from(now));
 
         if (inserted == 1) {
+            metrics.recordIdempotency(AurumMetrics.IdempotencyOutcome.CLAIMED);
             return new Claim(true, null);
         }
 
@@ -46,13 +50,16 @@ public class IdempotencyService {
         }
         StoredClaim existing = stored.getFirst();
         if (!existing.requestHash().equals(requestHash)) {
+            metrics.recordIdempotency(AurumMetrics.IdempotencyOutcome.CONFLICT);
             throw new ApiException(HttpStatus.CONFLICT, "IDEMPOTENCY_CONFLICT",
                     "This idempotency key was already used for a different request");
         }
         if (existing.transactionId() == null) {
+            metrics.recordIdempotency(AurumMetrics.IdempotencyOutcome.INCOMPLETE);
             throw new ApiException(HttpStatus.CONFLICT, "IDEMPOTENCY_INCOMPLETE",
                     "The prior request did not complete normally");
         }
+        metrics.recordIdempotency(AurumMetrics.IdempotencyOutcome.REPLAYED);
         return new Claim(false, existing.transactionId());
     }
 
@@ -80,4 +87,3 @@ public class IdempotencyService {
     private record StoredClaim(String requestHash, UUID transactionId) {
     }
 }
-

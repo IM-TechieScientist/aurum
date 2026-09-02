@@ -17,6 +17,30 @@ server:
   error:
     include-message: never
 
+aurum:
+  postgres-retry:
+    max-attempts: ${POSTGRES_RETRY_MAX_ATTEMPTS:3}
+    base-delay-millis: ${POSTGRES_RETRY_BASE_DELAY_MILLIS:10}
+  reconciliation:
+    schedule:
+      enabled: ${RECONCILIATION_SCHEDULE_ENABLED:true}
+      cron: ${RECONCILIATION_SCHEDULE_CRON:0 0 * * * *}
+      zone: ${RECONCILIATION_SCHEDULE_ZONE:UTC}
+  security:
+    users:
+      customer:
+        username: ${AURUM_CUSTOMER_USERNAME:customer}
+        password: ${AURUM_CUSTOMER_PASSWORD:customer-local}
+      operator:
+        username: ${AURUM_OPERATOR_USERNAME:operator}
+        password: ${AURUM_OPERATOR_PASSWORD:operator-local}
+      auditor:
+        username: ${AURUM_AUDITOR_USERNAME:auditor}
+        password: ${AURUM_AUDITOR_PASSWORD:auditor-local}
+      admin:
+        username: ${AURUM_ADMIN_USERNAME:admin}
+        password: ${AURUM_ADMIN_PASSWORD:admin-local}
+
 management:
   endpoints:
     web:
@@ -26,4 +50,3 @@ management:
     health:
       probes:
         enabled: true
-

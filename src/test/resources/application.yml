@@ -5,8 +5,18 @@ spring:
     hikari:
       maximum-pool-size: 12
 
+aurum:
+  reconciliation:
+    schedule:
+      enabled: false
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+
 logging:
   level:
     root: WARN
     org.testcontainers: INFO
-

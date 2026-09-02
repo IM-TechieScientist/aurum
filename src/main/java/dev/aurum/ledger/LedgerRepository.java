@@ -78,11 +78,11 @@ public class LedgerRepository {
     public List<TransactionSummary> history(UUID accountId, UUID beforeTransactionId, int limit) {
         if (beforeTransactionId == null) {
             return jdbc.query("""
-                    SELECT DISTINCT t.id, t.transaction_type, t.reference, t.reversal_of, t.created_at
-                      FROM ledger_transaction t
-                      JOIN ledger_entry e ON e.transaction_id = t.id
+                    SELECT t.id, t.transaction_type, t.reference, t.reversal_of, t.created_at
+                      FROM ledger_entry e
+                      JOIN ledger_transaction t ON t.id = e.transaction_id
                      WHERE e.account_id = ?
-                     ORDER BY t.created_at DESC, t.id DESC
+                     ORDER BY e.created_at DESC, e.transaction_id DESC
                      LIMIT ?
                     """, this::mapSummary, accountId, limit);
         }
@@ -96,15 +96,14 @@ public class LedgerRepository {
         }
         TransactionHeader cursor = cursors.getFirst();
         return jdbc.query("""
-                SELECT DISTINCT t.id, t.transaction_type, t.reference, t.reversal_of, t.created_at
-                  FROM ledger_transaction t
-                  JOIN ledger_entry e ON e.transaction_id = t.id
+                SELECT t.id, t.transaction_type, t.reference, t.reversal_of, t.created_at
+                  FROM ledger_entry e
+                  JOIN ledger_transaction t ON t.id = e.transaction_id
                  WHERE e.account_id = ?
-                   AND (t.created_at < ? OR (t.created_at = ? AND t.id < ?))
-                 ORDER BY t.created_at DESC, t.id DESC
+                   AND (e.created_at, e.transaction_id) < (?, ?)
+                 ORDER BY e.created_at DESC, e.transaction_id DESC
                  LIMIT ?
-                """, this::mapSummary, accountId, Timestamp.from(cursor.createdAt()),
-                Timestamp.from(cursor.createdAt()), cursor.id(), limit);
+                """, this::mapSummary, accountId, Timestamp.from(cursor.createdAt()), cursor.id(), limit);
     }
 
     private TransactionHeader mapHeader(ResultSet resultSet, int rowNumber) throws SQLException {
@@ -136,4 +135,3 @@ public class LedgerRepository {
     ) {
     }
 }
-

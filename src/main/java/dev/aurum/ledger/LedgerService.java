@@ -6,11 +6,15 @@ import dev.aurum.account.AccountType;
 import dev.aurum.account.AccountView;
 import dev.aurum.account.EntryDirection;
 import dev.aurum.common.ApiException;
+import dev.aurum.common.PostgresTransactionRetry;
 import dev.aurum.common.RequestHash;
 import dev.aurum.idempotency.IdempotencyService;
+import dev.aurum.observability.AurumMetrics;
+import io.micrometer.core.instrument.Timer;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Clock;
 import java.time.Instant;
@@ -27,14 +31,22 @@ public class LedgerService {
     private final LedgerRepository ledger;
     private final PostingService posting;
     private final IdempotencyService idempotency;
+    private final TransactionTemplate transactions;
+    private final PostgresTransactionRetry retries;
+    private final AurumMetrics metrics;
     private final Clock clock = Clock.systemUTC();
 
     public LedgerService(AccountRepository accounts, LedgerRepository ledger,
-                         PostingService posting, IdempotencyService idempotency) {
+                         PostingService posting, IdempotencyService idempotency,
+                         TransactionTemplate transactions, PostgresTransactionRetry retries,
+                         AurumMetrics metrics) {
         this.accounts = accounts;
         this.ledger = ledger;
         this.posting = posting;
         this.idempotency = idempotency;
+        this.transactions = transactions;
+        this.retries = retries;
+        this.metrics = metrics;
     }
 
     @Transactional
@@ -102,10 +114,31 @@ public class LedgerService {
         return result;
     }
 
-    @Transactional
     public TransactionView transfer(UUID sourceAccountId, UUID destinationAccountId,
                                     long amountMinor, String requestedCurrency,
                                     String reference, String idempotencyKey) {
+        Timer.Sample sample = metrics.startTransfer();
+        AurumMetrics.TransferOutcome outcome = AurumMetrics.TransferOutcome.SUCCESS;
+        try {
+            return retries.execute(
+                    () -> transactions.execute(status -> transferOnce(
+                            sourceAccountId, destinationAccountId, amountMinor,
+                            requestedCurrency, reference, idempotencyKey)),
+                    metrics::recordTransferRetry);
+        } catch (ApiException exception) {
+            outcome = AurumMetrics.TransferOutcome.BUSINESS_FAILURE;
+            throw exception;
+        } catch (RuntimeException exception) {
+            outcome = AurumMetrics.TransferOutcome.SYSTEM_FAILURE;
+            throw exception;
+        } finally {
+            metrics.finishTransfer(sample, outcome);
+        }
+    }
+
+    private TransactionView transferOnce(UUID sourceAccountId, UUID destinationAccountId,
+                                         long amountMinor, String requestedCurrency,
+                                         String reference, String idempotencyKey) {
         if (sourceAccountId.equals(destinationAccountId)) {
             throw new ApiException(HttpStatus.BAD_REQUEST, "SAME_ACCOUNT_TRANSFER",
                     "Source and destination accounts must be different");
