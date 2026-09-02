@@ -99,6 +99,55 @@ class AurumIntegrationTest {
     }
 
     @Test
+    void concurrentDuplicateRequestsCreateOneLogicalTransaction() throws Exception {
+        AccountView source = account("Concurrent idem source", "INR");
+        AccountView destination = account("Concurrent idem destination", "INR");
+        ledger.fund(source.id(), 1_000, "INR", null, key());
+        String idempotencyKey = key();
+        int attempts = 20;
+        CountDownLatch start = new CountDownLatch(1);
+        ExecutorService executor = Executors.newFixedThreadPool(attempts);
+        List<Future<UUID>> results = new ArrayList<>();
+
+        try {
+            for (int index = 0; index < attempts; index++) {
+                results.add(executor.submit(() -> {
+                    start.await();
+                    return ledger.transfer(source.id(), destination.id(), 100,
+                            "INR", "concurrent duplicate", idempotencyKey).id();
+                }));
+            }
+            start.countDown();
+
+            List<UUID> transactionIds = new ArrayList<>();
+            for (Future<UUID> result : results) {
+                transactionIds.add(result.get());
+            }
+            assertThat(transactionIds).hasSize(attempts).containsOnly(transactionIds.getFirst());
+
+            UUID transactionId = transactionIds.getFirst();
+            assertThat(jdbc.queryForObject(
+                    "SELECT COUNT(*) FROM ledger_transaction WHERE id = ?",
+                    Long.class, transactionId)).isEqualTo(1);
+            assertThat(jdbc.queryForObject("""
+                    SELECT COUNT(*) FROM idempotency_record
+                     WHERE scope = 'transfer' AND idempotency_key = ? AND transaction_id = ?
+                    """, Long.class, idempotencyKey, transactionId)).isEqualTo(1);
+        } finally {
+            executor.shutdownNow();
+        }
+
+        assertThat(accounts.get(source.id()).balanceMinor()).isEqualTo(900);
+        assertThat(accounts.get(destination.id()).balanceMinor()).isEqualTo(100);
+        assertThatThrownBy(() -> ledger.transfer(source.id(), destination.id(), 200,
+                "INR", "concurrent duplicate", idempotencyKey))
+                .isInstanceOfSatisfying(ApiException.class,
+                        exception -> assertThat(exception.code()).isEqualTo("IDEMPOTENCY_CONFLICT"));
+        assertThat(accounts.get(source.id()).balanceMinor()).isEqualTo(900);
+        assertThat(accounts.get(destination.id()).balanceMinor()).isEqualTo(100);
+    }
+
+    @Test
     void withdrawalIsBalancedAndIdempotent() {
         AccountView account = account("Withdrawal account", "INR");
         ledger.fund(account.id(), 10_000, "INR", "initial funding", key());
