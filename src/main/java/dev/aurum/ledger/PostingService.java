@@ -4,6 +4,7 @@ import dev.aurum.account.AccountRepository;
 import dev.aurum.account.AccountType;
 import dev.aurum.account.AccountView;
 import dev.aurum.common.ApiException;
+import dev.aurum.reliability.FailureProbe;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 
@@ -15,16 +16,20 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 @Service
 public class PostingService {
 
     private final AccountRepository accounts;
     private final LedgerRepository ledger;
+    private final FailureProbe failures;
 
-    public PostingService(AccountRepository accounts, LedgerRepository ledger) {
+    public PostingService(AccountRepository accounts, LedgerRepository ledger, FailureProbe failures) {
         this.accounts = accounts;
         this.ledger = ledger;
+        this.failures = failures;
     }
 
     public Map<UUID, AccountView> lockAccounts(Collection<UUID> accountIds) {
@@ -69,11 +74,26 @@ public class PostingService {
 
         UUID transactionId = UUID.randomUUID();
         ledger.insertTransaction(transactionId, type, normalizeReference(reference), reversalOf, now);
+        failures.check(FailureProbe.FailurePoint.AFTER_TRANSACTION_INSERT);
         for (LedgerEntryDraft entry : entries) {
             ledger.insertEntry(UUID.randomUUID(), transactionId, entry, now);
         }
+        failures.check(FailureProbe.FailurePoint.AFTER_LEDGER_ENTRIES_INSERTED);
         resultingBalances.forEach((accountId, balance) -> accounts.updateBalance(accountId, balance, now));
+        registerBeforeCommitProbe();
         return ledger.find(transactionId).orElseThrow();
+    }
+
+    private void registerBeforeCommitProbe() {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            throw new IllegalStateException("Ledger posting requires transaction synchronization");
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void beforeCommit(boolean readOnly) {
+                failures.check(FailureProbe.FailurePoint.BEFORE_COMMIT);
+            }
+        });
     }
 
     private void validateBalanced(List<LedgerEntryDraft> entries) {

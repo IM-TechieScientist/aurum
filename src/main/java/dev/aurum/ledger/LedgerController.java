@@ -18,6 +18,8 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
+import dev.aurum.security.ResourceAuthorizationService;
+import dev.aurum.reliability.FailureProbe;
 
 import java.util.List;
 import java.util.UUID;
@@ -29,9 +31,14 @@ public class LedgerController {
 
     private static final long MAX_AMOUNT_MINOR = 9_000_000_000_000_000L;
     private final LedgerService ledger;
+    private final ResourceAuthorizationService authorization;
+    private final FailureProbe failures;
 
-    public LedgerController(LedgerService ledger) {
+    public LedgerController(LedgerService ledger, ResourceAuthorizationService authorization,
+                            FailureProbe failures) {
         this.ledger = ledger;
+        this.authorization = authorization;
+        this.failures = failures;
     }
 
     @PostMapping("/accounts/{accountId}/fund")
@@ -39,8 +46,9 @@ public class LedgerController {
     TransactionView fund(@PathVariable UUID accountId,
                          @RequestHeader("Idempotency-Key") String idempotencyKey,
                          @Valid @RequestBody FundingRequest request) {
-        return ledger.fund(accountId, request.amountMinor(), request.currency(),
+        TransactionView result = ledger.fund(accountId, request.amountMinor(), request.currency(),
                 request.reference(), idempotencyKey);
+        return afterCommit(result);
     }
 
     @PostMapping("/accounts/{accountId}/withdraw")
@@ -48,16 +56,20 @@ public class LedgerController {
     TransactionView withdraw(@PathVariable UUID accountId,
                              @RequestHeader("Idempotency-Key") String idempotencyKey,
                              @Valid @RequestBody WithdrawalRequest request) {
-        return ledger.withdraw(accountId, request.amountMinor(), request.currency(),
+        authorization.requireAccountAccess(accountId);
+        TransactionView result = ledger.withdraw(accountId, request.amountMinor(), request.currency(),
                 request.reference(), idempotencyKey);
+        return afterCommit(result);
     }
 
     @PostMapping("/transfers")
     @ResponseStatus(HttpStatus.CREATED)
     TransactionView transfer(@RequestHeader("Idempotency-Key") String idempotencyKey,
                              @Valid @RequestBody TransferRequest request) {
-        return ledger.transfer(request.sourceAccountId(), request.destinationAccountId(),
+        authorization.requireAccountAccess(request.sourceAccountId());
+        TransactionView result = ledger.transfer(request.sourceAccountId(), request.destinationAccountId(),
                 request.amountMinor(), request.currency(), request.reference(), idempotencyKey);
+        return afterCommit(result);
     }
 
     @PostMapping("/transactions/{transactionId}/reversal")
@@ -65,11 +77,12 @@ public class LedgerController {
     TransactionView reverse(@PathVariable UUID transactionId,
                             @RequestHeader("Idempotency-Key") String idempotencyKey,
                             @Valid @RequestBody ReversalRequest request) {
-        return ledger.reverse(transactionId, request.reason(), idempotencyKey);
+        return afterCommit(ledger.reverse(transactionId, request.reason(), idempotencyKey));
     }
 
     @GetMapping("/transactions/{transactionId}")
     TransactionView transaction(@PathVariable UUID transactionId) {
+        authorization.requireTransactionAccess(transactionId);
         return ledger.get(transactionId);
     }
 
@@ -77,6 +90,7 @@ public class LedgerController {
     List<TransactionSummary> history(@PathVariable UUID accountId,
                                      @RequestParam(required = false) UUID before,
                                      @RequestParam(defaultValue = "20") @Min(1) @Max(50) int limit) {
+        authorization.requireAccountAccess(accountId);
         return ledger.history(accountId, before, limit);
     }
 
@@ -104,5 +118,10 @@ public class LedgerController {
     }
 
     public record ReversalRequest(@NotBlank @Size(max = 200) String reason) {
+    }
+
+    private TransactionView afterCommit(TransactionView result) {
+        failures.check(FailureProbe.FailurePoint.AFTER_COMMIT_BEFORE_RESPONSE);
+        return result;
     }
 }

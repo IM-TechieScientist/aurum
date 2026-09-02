@@ -52,6 +52,7 @@ class LedgerPropertyTest {
                         "spring.datasource.username=" + postgres.getUsername(),
                         "spring.datasource.password=" + postgres.getPassword(),
                         "spring.main.banner-mode=off",
+                        "debug=false",
                         "logging.level.root=WARN")
                 .run();
         accounts = context.getBean(AccountService.class);

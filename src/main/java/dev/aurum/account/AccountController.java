@@ -4,6 +4,7 @@ import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
+import dev.aurum.security.ResourceAuthorizationService;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
@@ -21,24 +22,28 @@ import java.util.UUID;
 public class AccountController {
 
     private final AccountService accounts;
+    private final ResourceAuthorizationService authorization;
 
-    public AccountController(AccountService accounts) {
+    public AccountController(AccountService accounts, ResourceAuthorizationService authorization) {
         this.accounts = accounts;
+        this.authorization = authorization;
     }
 
     @PostMapping
     @ResponseStatus(HttpStatus.CREATED)
     AccountView create(@Valid @RequestBody CreateAccountRequest request) {
-        return accounts.create(request.ownerName(), request.currency());
+        return accounts.create(request.ownerName(), request.ownerUsername(), request.currency());
     }
 
     @GetMapping("/{accountId}")
     AccountView get(@PathVariable UUID accountId) {
+        authorization.requireAccountAccess(accountId);
         return accounts.get(accountId);
     }
 
     @GetMapping("/{accountId}/balance")
     BalanceResponse balance(@PathVariable UUID accountId) {
+        authorization.requireAccountAccess(accountId);
         AccountView account = accounts.get(accountId);
         return new BalanceResponse(account.id(), account.currency(), account.balanceMinor());
     }
@@ -53,8 +58,14 @@ public class AccountController {
         return accounts.changeStatus(accountId, AccountStatus.ACTIVE);
     }
 
+    @PatchMapping("/{accountId}/close")
+    AccountView close(@PathVariable UUID accountId) {
+        return accounts.changeStatus(accountId, AccountStatus.CLOSED);
+    }
+
     public record CreateAccountRequest(
             @NotBlank @Size(max = 120) String ownerName,
+            @NotBlank @Size(max = 80) String ownerUsername,
             @NotBlank @Pattern(regexp = "^[A-Za-z]{3}$") String currency
     ) {
     }

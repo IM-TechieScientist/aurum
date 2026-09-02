@@ -1,79 +1,101 @@
 # Testing strategy
 
-Run everything with:
+Aurum tests financial rules at the API, service and database layers. PostgreSQL integration tests
+use the same database engine, constraints and locking behavior as the running application.
+
+## Standard verification
 
 ```bash
 mvn verify
 ```
 
-The existing GitHub Actions workflow runs this command on every push and pull request. It therefore
-provides compilation, automated tests and application packaging in CI. Static analysis, container
-publishing and deployment are separate future pipeline stages, not prerequisites for the test suite.
-
-All persistence and HTTP integration tests use real PostgreSQL through Testcontainers. H2 is not
-used because its locking, transaction and SQL behavior would not prove Aurum's main guarantees.
+The current suite reports 26 passing tests. Testcontainers starts PostgreSQL 16 automatically, so
+the Compose database does not need to be running. GitHub Actions executes the same command for every
+push and pull request.
 
 ## Verification layers
 
-### PostgreSQL integration tests
+### Ledger and database integration
 
-These cover successful and rejected money operations, rollback, immutable entries, deferred
-balance constraints, reversals, history, projection rebuilding and reconciliation.
+Integration tests cover funding, withdrawals, transfers, insufficient funds, currency checks,
+account states, transaction history, reversals, idempotent replay, projection rebuilding and
+reconciliation. Direct SQL tests also verify that PostgreSQL rejects unbalanced transactions and
+updates or deletes against immutable ledger and audit tables.
 
-### Concurrency tests
+### HTTP contracts and authorization
 
-- Twenty transfers compete for one funded source; exactly the affordable number succeeds.
-- Twenty identical requests share one idempotency key; every caller receives one transaction ID
-  and balances move once.
+MockMvc sends requests through Spring Security, request validation, controllers, services and
+PostgreSQL. These tests verify:
 
-### MockMvc contract tests
+- successful HTTP 201 transaction responses and exact replay;
+- structured `application/problem+json` errors;
+- public health and protected API routes;
+- role restrictions for CUSTOMER, OPERATOR, AUDITOR and ADMIN;
+- customer ownership checks and cross-customer resource hiding;
+- account closure, user administration, audit access and metric visibility.
 
-HTTP tests exercise the complete controller, validation, service and database path. They verify
-HTTP status codes, transaction JSON, exact replay, RFC 9457-style Problem Details and Actuator
-metric visibility. Security contract tests also verify public health access, JSON 401/403
-responses, CUSTOMER denial on operator operations and AUDITOR reconciliation access.
+### Concurrent requests
 
-### Property-based tests
+Two tests exercise database behavior under contention:
 
-jqwik generates sequences containing funding, withdrawals, bidirectional transfers, account
-freezes/unfreezes and reversals. After every generated operation, the suite asserts:
+- Twenty transfers compete for one funded source account. Only the affordable transfers succeed,
+  and the source never becomes negative.
+- Twenty requests use the same idempotency key concurrently. Every successful caller receives the
+  same transaction ID, and balances move once.
 
-- all transaction debit totals equal credit totals;
-- every transaction has at least two entries and one currency;
-- no customer projection is negative;
-- application balances match an independent test model;
-- reconciliation reports no ledger/projection mismatch.
+### Property-based operation sequences
 
-The property suite boots the actual application against PostgreSQL. It uses 20 generated
-sequences per build and disables shrinking because each attempt intentionally leaves an immutable
-audit trail in the shared test database.
+jqwik generates 20 sequences containing funding, withdrawals, transfers, freezes, unfreezes and
+reversals. After each operation, the test checks:
 
-### Retry classification tests
+- debit totals equal credit totals;
+- each transaction contains at least two entries and one currency;
+- customer balances are non-negative;
+- stored projections match an independent test model;
+- full reconciliation reports no mismatch.
 
-Focused tests prove that deadlocks and serialization failures retry up to the configured bound,
-while business failures and unrelated SQLSTATE values execute once.
+Each generated sequence writes immutable history to the shared test database, so shrinking is
+disabled and every try starts from newly created accounts.
 
-### Opt-in SQL benchmark
+### PostgreSQL retry classification
 
-`SqlBenchmark` generates a large ephemeral ledger and measures indexed balance/history queries plus
-full reconciliation. It is deliberately excluded from routine `mvn verify`; see the
-[benchmarking guide](benchmarking.md) for the command and methodology.
+Focused unit tests verify that transfer execution retries SQLSTATE `40P01` and `40001`, stops at the
+configured attempt limit and does not retry domain failures or unrelated SQL errors.
 
-### Scheduled reconciliation tests
+### Controlled failures
 
-The clock-driven trigger is disabled during tests. Integration tests invoke the same job directly
-and verify consistent and mismatched reports, immutable mismatch details, bounded metrics, secured
-history access and advisory-lock skips.
+Integration tests inject failures after the transaction insert, after entry inserts, before commit
+and after commit but before the HTTP response. They verify complete rollback before commit and
+idempotent recovery when a client loses a successful response.
 
-## Storage-conscious local runs
+### Scheduled reconciliation
 
-Generated output lives under ignored `target/`. To avoid retaining a Maven cache for an isolated
-verification, use a temporary repository and remove it afterward:
+The clock-driven trigger is disabled in tests. The suite invokes the same reconciliation job
+directly and verifies consistent and mismatched reports, immutable details, metrics, access rules
+and advisory-lock skips.
+
+## Performance harnesses
+
+The SQL and HTTP benchmarks are separate from the standard verification suite because they create
+larger fixtures and measure machine-dependent latency.
+
+```bash
+mvn -Dtest=SqlBenchmark test
+mvn -Dtest=HttpLoadBenchmark test
+```
+
+Both commands fail on correctness errors and write reports under `target/benchmarks/`. See
+[SQL benchmarking](benchmarking.md) and [HTTP load testing](load-testing.md) for their workloads and
+reference results.
+
+## Storage-conscious test run
+
+Generated output stays under the ignored `target/` directory. To keep Maven dependencies outside
+the normal local cache for a one-off run, use a temporary repository:
 
 ```bash
 mvn -Dmaven.repo.local=/tmp/aurum-m2 verify
 mvn clean
 ```
 
-The PostgreSQL image is reusable. Testcontainers' small Ryuk helper image can be removed between
-runs if minimizing disk use is more important than avoiding the next download.
+Remove `/tmp/aurum-m2` after the run if the dependencies are no longer needed.

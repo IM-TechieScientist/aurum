@@ -106,6 +106,19 @@ public class LedgerRepository {
                 """, this::mapSummary, accountId, Timestamp.from(cursor.createdAt()), cursor.id(), limit);
     }
 
+    public boolean isVisibleToOwner(UUID transactionId, String username) {
+        Boolean visible = jdbc.queryForObject("""
+                SELECT EXISTS (
+                    SELECT 1
+                      FROM ledger_entry e
+                      JOIN account a ON a.id = e.account_id
+                      JOIN app_user u ON u.id = a.owner_user_id
+                     WHERE e.transaction_id = ? AND u.username = ?
+                )
+                """, Boolean.class, transactionId, username);
+        return Boolean.TRUE.equals(visible);
+    }
+
     private TransactionHeader mapHeader(ResultSet resultSet, int rowNumber) throws SQLException {
         return new TransactionHeader(
                 resultSet.getObject("id", UUID.class),

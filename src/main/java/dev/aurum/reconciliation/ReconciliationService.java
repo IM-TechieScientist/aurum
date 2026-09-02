@@ -1,5 +1,7 @@
 package dev.aurum.reconciliation;
 
+import dev.aurum.audit.AuditAction;
+import dev.aurum.audit.AuditService;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -29,10 +31,12 @@ public class ReconciliationService {
             """;
 
     private final JdbcTemplate jdbc;
+    private final AuditService audit;
     private final Clock clock = Clock.systemUTC();
 
-    public ReconciliationService(JdbcTemplate jdbc) {
+    public ReconciliationService(JdbcTemplate jdbc, AuditService audit) {
         this.jdbc = jdbc;
+        this.audit = audit;
     }
 
     @Transactional(readOnly = true)
@@ -71,7 +75,10 @@ public class ReconciliationService {
                         mismatch.accountId(), mismatch.currency(),
                         mismatch.projectedBalanceMinor(), mismatch.ledgerBalanceMinor()))
                 .toList();
-        return new RebuildResult(accountIds.size(), repairs.size(), rebuiltAt, repairs);
+        RebuildResult result = new RebuildResult(accountIds.size(), repairs.size(), rebuiltAt, repairs);
+        audit.record(AuditAction.REBUILD_PROJECTIONS, "RECONCILIATION", rebuiltAt,
+                Integer.toString(repairs.size()));
+        return result;
     }
 
     private List<BalanceMismatch> findMismatches() {

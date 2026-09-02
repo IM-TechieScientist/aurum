@@ -15,10 +15,12 @@ import java.util.UUID;
 public class AccountRepository {
 
     private static final String SELECT_ACCOUNT = """
-            SELECT a.id, a.owner_name, a.currency, a.account_type, a.normal_side,
+            SELECT a.id, a.owner_name, a.owner_user_id, u.username AS owner_username,
+                   a.currency, a.account_type, a.normal_side,
                    a.status, a.created_at, b.balance_minor
               FROM account a
               JOIN account_balance b ON b.account_id = a.id
+              LEFT JOIN app_user u ON u.id = a.owner_user_id
             """;
 
     private final JdbcTemplate jdbc;
@@ -27,13 +29,13 @@ public class AccountRepository {
         this.jdbc = jdbc;
     }
 
-    public AccountView create(String ownerName, String currency, Instant now) {
+    public AccountView create(String ownerName, UUID ownerUserId, String currency, Instant now) {
         UUID id = UUID.randomUUID();
         jdbc.update("""
                 INSERT INTO account
-                    (id, owner_name, currency, account_type, normal_side, status, created_at)
-                VALUES (?, ?, ?, 'CUSTOMER', 'CREDIT', 'ACTIVE', ?)
-                """, id, ownerName, currency, Timestamp.from(now));
+                    (id, owner_name, owner_user_id, currency, account_type, normal_side, status, created_at)
+                VALUES (?, ?, ?, ?, 'CUSTOMER', 'CREDIT', 'ACTIVE', ?)
+                """, id, ownerName, ownerUserId, currency, Timestamp.from(now));
         jdbc.update("""
                 INSERT INTO account_balance (account_id, balance_minor, updated_at)
                 VALUES (?, 0, ?)
@@ -67,10 +69,24 @@ public class AccountRepository {
                 status.name(), accountId) == 1;
     }
 
+    public boolean isOwnedBy(UUID accountId, String username) {
+        Boolean owned = jdbc.queryForObject("""
+                SELECT EXISTS (
+                    SELECT 1
+                      FROM account a
+                      JOIN app_user u ON u.id = a.owner_user_id
+                     WHERE a.id = ? AND u.username = ?
+                )
+                """, Boolean.class, accountId, username);
+        return Boolean.TRUE.equals(owned);
+    }
+
     private AccountView map(ResultSet resultSet, int rowNumber) throws SQLException {
         return new AccountView(
                 resultSet.getObject("id", UUID.class),
                 resultSet.getString("owner_name"),
+                resultSet.getObject("owner_user_id", UUID.class),
+                resultSet.getString("owner_username"),
                 resultSet.getString("currency"),
                 AccountType.valueOf(resultSet.getString("account_type")),
                 EntryDirection.valueOf(resultSet.getString("normal_side")),
@@ -80,4 +96,3 @@ public class AccountRepository {
         );
     }
 }
-

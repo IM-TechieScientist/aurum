@@ -5,4 +5,4 @@ target/
 *.log
 .env
 .DS_Store
-
+docs/project-status.md

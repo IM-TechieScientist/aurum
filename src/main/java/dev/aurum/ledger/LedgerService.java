@@ -10,6 +10,8 @@ import dev.aurum.common.PostgresTransactionRetry;
 import dev.aurum.common.RequestHash;
 import dev.aurum.idempotency.IdempotencyService;
 import dev.aurum.observability.AurumMetrics;
+import dev.aurum.audit.AuditAction;
+import dev.aurum.audit.AuditService;
 import io.micrometer.core.instrument.Timer;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
@@ -34,12 +36,13 @@ public class LedgerService {
     private final TransactionTemplate transactions;
     private final PostgresTransactionRetry retries;
     private final AurumMetrics metrics;
+    private final AuditService audit;
     private final Clock clock = Clock.systemUTC();
 
     public LedgerService(AccountRepository accounts, LedgerRepository ledger,
                          PostingService posting, IdempotencyService idempotency,
                          TransactionTemplate transactions, PostgresTransactionRetry retries,
-                         AurumMetrics metrics) {
+                         AurumMetrics metrics, AuditService audit) {
         this.accounts = accounts;
         this.ledger = ledger;
         this.posting = posting;
@@ -47,6 +50,7 @@ public class LedgerService {
         this.transactions = transactions;
         this.retries = retries;
         this.metrics = metrics;
+        this.audit = audit;
     }
 
     @Transactional
@@ -72,11 +76,13 @@ public class LedgerService {
                         "No settlement account exists for this currency"));
 
         Map<UUID, AccountView> locked = posting.lockAccounts(List.of(settlement.id(), target.id()));
+        requireOpen(locked.get(target.id()), "A closed account cannot receive funding");
         TransactionView result = posting.post(TransactionType.FUNDING, reference, null, List.of(
                 new LedgerEntryDraft(settlement.id(), EntryDirection.DEBIT, amountMinor, currency),
                 new LedgerEntryDraft(target.id(), EntryDirection.CREDIT, amountMinor, currency)
         ), locked, now);
         idempotency.complete(scope, idempotencyKey, result.id());
+        audit.record(AuditAction.FUND, "TRANSACTION", result.id(), idempotencyKey);
         return result;
     }
 
@@ -101,6 +107,10 @@ public class LedgerService {
 
         Map<UUID, AccountView> locked = posting.lockAccounts(List.of(source.id(), settlement.id()));
         source = locked.get(source.id());
+        if (source.status() == AccountStatus.CLOSED) {
+            throw new ApiException(HttpStatus.CONFLICT, "ACCOUNT_CLOSED",
+                    "A closed account cannot withdraw funds");
+        }
         if (source.status() != AccountStatus.ACTIVE) {
             throw new ApiException(HttpStatus.CONFLICT, "ACCOUNT_FROZEN",
                     "A frozen account cannot withdraw funds");
@@ -111,6 +121,7 @@ public class LedgerService {
                 new LedgerEntryDraft(settlement.id(), EntryDirection.CREDIT, amountMinor, currency)
         ), locked, now);
         idempotency.complete(scope, idempotencyKey, result.id());
+        audit.record(AuditAction.WITHDRAW, "TRANSACTION", result.id(), idempotencyKey);
         return result;
     }
 
@@ -160,6 +171,11 @@ public class LedgerService {
         requireCustomerAccount(destination);
         requireCurrency(source, currency);
         requireCurrency(destination, currency);
+        if (source.status() == AccountStatus.CLOSED) {
+            throw new ApiException(HttpStatus.CONFLICT, "ACCOUNT_CLOSED",
+                    "A closed account cannot send funds");
+        }
+        requireOpen(destination, "A closed account cannot receive funds");
         if (source.status() != AccountStatus.ACTIVE) {
             throw new ApiException(HttpStatus.CONFLICT, "ACCOUNT_FROZEN",
                     "A frozen account cannot send funds");
@@ -170,6 +186,7 @@ public class LedgerService {
                 new LedgerEntryDraft(destination.id(), EntryDirection.CREDIT, amountMinor, currency)
         ), locked, now);
         idempotency.complete(scope, idempotencyKey, result.id());
+        audit.record(AuditAction.TRANSFER, "TRANSACTION", result.id(), idempotencyKey);
         return result;
     }
 
@@ -194,6 +211,10 @@ public class LedgerService {
 
         List<UUID> accountIds = original.entries().stream().map(LedgerEntryView::accountId).toList();
         Map<UUID, AccountView> locked = posting.lockAccounts(accountIds);
+        locked.values().stream()
+                .filter(account -> account.accountType() == AccountType.CUSTOMER)
+                .forEach(account -> requireOpen(account,
+                        "A transaction involving a closed account cannot be reversed"));
         if (ledger.findReversal(originalTransactionId).isPresent()) {
             throw alreadyReversed();
         }
@@ -206,6 +227,7 @@ public class LedgerService {
         TransactionView result = posting.post(TransactionType.REVERSAL, reason, originalTransactionId,
                 compensatingEntries, locked, now);
         idempotency.complete(scope, idempotencyKey, result.id());
+        audit.record(AuditAction.REVERSAL, "TRANSACTION", result.id(), idempotencyKey);
         return result;
     }
 
@@ -241,6 +263,12 @@ public class LedgerService {
         if (!account.currency().equals(currency)) {
             throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "CURRENCY_MISMATCH",
                     "Account and request currencies do not match");
+        }
+    }
+
+    private void requireOpen(AccountView account, String message) {
+        if (account.status() == AccountStatus.CLOSED) {
+            throw new ApiException(HttpStatus.CONFLICT, "ACCOUNT_CLOSED", message);
         }
     }
 

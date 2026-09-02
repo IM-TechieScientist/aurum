@@ -1,36 +1,39 @@
 # SQL benchmarking
 
-Aurum includes an opt-in PostgreSQL benchmark named `SqlBenchmark`. It does not run in ordinary
-`mvn verify` or GitHub Actions builds, so it adds no routine CI time or retained database storage.
+`SqlBenchmark` measures the PostgreSQL queries that support balances, account history and
+reconciliation. It runs against a fresh Testcontainers database and writes a Markdown report with
+client latency percentiles and full JSON query plans.
 
-## Workload
+## Dataset
 
 The default fixture contains:
 
 - 1,000 customer accounts;
 - 100,000 balanced transfer transactions;
 - 200,000 immutable ledger entries;
-- one hot account participating in every transaction.
+- one account involved in every transaction.
 
-It measures projected-balance lookup, newest-20 hot-account history and full-ledger reconciliation.
-Every run also captures PostgreSQL `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` plans and checks that
-balance and history queries use their intended indexes.
+The benchmark measures:
 
-The report also executes the pre-optimization history query a small number of times. Keeping this
-legacy comparison in the harness makes the improvement reproducible without retaining a second
-database snapshot or generated dataset.
+1. projected balance lookup by account ID;
+2. the previous account-history query;
+3. the current newest-20 account-history query;
+4. full-ledger reconciliation.
 
-Fixture rows are generated with set-based SQL inside an ephemeral Testcontainers database. Trigger
-execution is disabled only for the fixture-loading transaction to keep setup time separate from the
-read measurements. The generated postings remain balanced, single-currency and reconciliation-safe.
+Fixture rows are generated with set-based SQL. Trigger execution is disabled only while loading
+the fixture so setup cost does not dominate the read measurements. The harness verifies row counts,
+balanced projections and a clean reconciliation result before collecting timings.
 
-## Run it
+For the balance and current history queries, the test also checks that PostgreSQL selected the
+expected indexes. Every measured query receives `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` output.
+
+## Running the benchmark
 
 ```bash
 mvn -Dtest=SqlBenchmark test
 ```
 
-Override scale when needed:
+Change the fixture size with JVM properties:
 
 ```bash
 mvn -Dtest=SqlBenchmark \
@@ -38,35 +41,29 @@ mvn -Dtest=SqlBenchmark \
   -Daurum.benchmark.transactions=500000 test
 ```
 
-The transaction count must be a positive even number. Results and full JSON plans are written to
-`target/benchmarks/sql-benchmark.md`; `mvn clean` removes them. PostgreSQL containers and their
-writable layers are also removed automatically after the run.
+The account count must be at least two. The transaction count must be positive and even. The report
+is written to `target/benchmarks/sql-benchmark.md`; `mvn clean` removes the report and generated
+build files.
 
-## Reading results
+The benchmark is separate from `mvn verify` so routine CI remains focused on correctness. Compare
+runs using the same machine, JVM, PostgreSQL image, fixture size and cache conditions.
 
-Client-observed percentiles include local JDBC and Java result mapping. The plan's execution time
-isolates PostgreSQL more closely. Neither should be presented as a production SLO: hardware,
-container limits, dataset distribution, concurrency and cache temperature all affect results.
+## Reference result
 
-Use the benchmark to compare a controlled change on the same machine. Do not add a hard latency
-gate to CI; assert correctness and index selection, then record performance as evidence.
-
-## Reference optimization run
-
-The 2026-09-02 development-machine run used PostgreSQL 16.15, Java 21.0.12 and the default
-100,000-transaction dataset. These figures are evidence for the query change, not an SLO:
+This result was recorded on 2026-09-02 with PostgreSQL 16.15, Java 21.0.12 and the default dataset:
 
 | Query | p50 | p95 | p99 | PostgreSQL execution |
 |---|---:|---:|---:|---:|
-| Projected balance | 0.146 ms | 0.206 ms | 0.237 ms | 0.029 ms |
-| Legacy hot-account history | 144.344 ms | 148.580 ms | 150.288 ms | 73.179 ms |
-| Indexed hot-account history | 1.326 ms | 1.472 ms | 1.561 ms | 1.017 ms |
-| Full reconciliation | 62.327 ms | 62.860 ms | 62.860 ms | 91.702 ms |
+| Projected balance | 0.133 ms | 0.178 ms | 0.206 ms | 0.030 ms |
+| Previous hot-account history | 145.875 ms | 149.247 ms | 150.812 ms | 74.557 ms |
+| Indexed hot-account history | 1.401 ms | 1.796 ms | 1.983 ms | 0.917 ms |
+| Full reconciliation | 62.953 ms | 63.807 ms | 63.807 ms | 94.230 ms |
 
-The production history query's median client latency improved by approximately **109x**. Its
-PostgreSQL plan changed from scanning/joining and externally sorting the hot-account result set to
-an ordered `ledger_entry_account_history` index-only scan followed by primary-key transaction
-lookups. Server execution improved by approximately **72x** in this run.
+The current history query reduced median client-observed latency by approximately **104x** and
+PostgreSQL execution time by approximately **81x** in this run. Its plan reads the newest entries
+through `ledger_entry_account_history`, then resolves transaction details by primary key. The
+previous query scanned and joined the full hot-account history before sorting it.
 
-The client and plan reconciliation timings are separate executions and can differ with parallel
-planning and cache state; compare each metric only with the same metric from another run.
+Client timings include JDBC and Java mapping. PostgreSQL execution timings come from separate
+`EXPLAIN ANALYZE` executions, so each column should be compared with the same measurement in another
+run rather than across columns.

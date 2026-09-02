@@ -6,6 +6,8 @@ import java.util.UUID;
 public record AccountView(
         UUID id,
         String ownerName,
+        UUID ownerUserId,
+        String ownerUsername,
         String currency,
         AccountType accountType,
         EntryDirection normalSide,
@@ -14,4 +16,3 @@ public record AccountView(
         Instant createdAt
 ) {
 }
-

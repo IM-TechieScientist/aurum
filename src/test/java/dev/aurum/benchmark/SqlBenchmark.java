@@ -152,9 +152,11 @@ class SqlBenchmark {
             jdbc.execute("SET LOCAL session_replication_role = replica");
             jdbc.update("""
                     INSERT INTO account
-                        (id, owner_name, currency, account_type, normal_side, status, created_at)
+                        (id, owner_name, owner_user_id, currency, account_type, normal_side,
+                         status, created_at)
                     SELECT md5('benchmark-account-' || sequence)::UUID,
                            'Benchmark account ' || sequence,
+                           '00000000-0000-0000-0000-000000000101'::UUID,
                            'INR', 'CUSTOMER', 'CREDIT', 'ACTIVE',
                            TIMESTAMPTZ '2026-01-01 00:00:00+00'
                       FROM generate_series(1, ?) sequence

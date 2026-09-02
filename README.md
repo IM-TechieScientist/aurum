@@ -1,84 +1,102 @@
-# Aurum Core
+# Aurum
 
-Aurum is a compact, high-integrity transaction ledger built with Java 21, Spring Boot 3,
-PostgreSQL, Flyway and Testcontainers. It deliberately focuses on a small money-moving
-workflow and makes its correctness properties visible in code and tests.
+Aurum is a transaction ledger API built with Java 21, Spring Boot and PostgreSQL. It manages
+customer accounts, funding, withdrawals, transfers and reversals through an immutable double-entry
+ledger. Database constraints, row locking, idempotency records and reconciliation protect the
+ledger when requests are concurrent, retried or interrupted.
 
-## What it demonstrates
+I built Aurum to learn how financial backends apply double-entry accounting, ACID transactions,
+concurrency control, idempotent API design, role-based access control (RBAC), audit trails, failure
+recovery, database benchmarking and container-based delivery.
 
-- Immutable double-entry postings: every transaction has equal debits and credits.
-- Atomic funding, transfers, reversals, idempotency records and balance projections.
-- Deterministic PostgreSQL row locking to prevent deadlocks and overdrafts.
-- Concurrent duplicate-request safety through database-backed idempotency keys.
-- Bounded transfer retries for PostgreSQL deadlocks and serialization failures.
-- Reversals as compensating entries; posted history is never edited or deleted.
-- Reconciliation plus transactionally locked projection rebuilding.
-- Scheduled reconciliation with cross-instance locking and immutable mismatch reports.
-- Custom transfer and idempotency metrics through Spring Boot Actuator.
-- Stateless HTTP Basic authentication with CUSTOMER, OPERATOR, AUDITOR and ADMIN route permissions.
-- Reproducible SQL plans and latency measurements over a 100,000-transaction hot-account dataset.
-- Real PostgreSQL, MockMvc, contention and jqwik property-based tests.
+## Key capabilities
 
-Amounts are integer minor units. For example, `2500` INR means INR 25.00. Aurum never
-uses floating point for money.
+### Ledger correctness
 
-## Prerequisites
+- Every transaction contains balanced debit and credit entries in one currency.
+- Ledger transactions and entries are append-only; corrections create linked reversal transactions
+  with compensating entries.
+- Amounts use integer minor units, so INR `2500` represents INR 25.00.
+- PostgreSQL commits the ledger entries, balance projection, idempotency result and audit event in
+  one transaction.
+- Database triggers reject ledger mutations and unbalanced postings.
 
-- Java **21 JDK** (not only the JRE; `javac -version` must report 21)
-- Maven 3.6.3+
-- Docker with Compose v2
+### Reliability and security
+
+- Deterministic `SELECT ... FOR UPDATE` locking prevents lost updates and overspending.
+- Database-backed idempotency returns the original transaction for an exact retry and rejects a
+  reused key with a different payload.
+- Transfers retry PostgreSQL deadlocks and serialization failures with bounded jitter.
+- CUSTOMER, OPERATOR, AUDITOR and ADMIN roles control routes and account-level access.
+- Accounts have durable owners and support ACTIVE, FROZEN and irreversible CLOSED states.
+- Actor-attributed audit events record sensitive user, account, ledger and rebuild operations.
+
+### Verification and delivery
+
+- Scheduled reconciliation compares balance projections with balances derived from the ledger and
+  stores immutable run reports.
+- JUnit, MockMvc, Testcontainers and jqwik cover HTTP contracts, PostgreSQL constraints,
+  concurrency, rollback, failure injection and generated operation sequences.
+- SQL and HTTP benchmark harnesses report query plans, throughput and latency percentiles.
+- Spring Boot Actuator exposes health checks and fixed-cardinality ledger metrics.
+- GitHub Actions verifies every push and pull request and publishes tagged images to GHCR.
+
+## Technology
+
+| Area | Technology |
+|---|---|
+| Application | Java 21, Spring Boot 3.5, Spring MVC, Spring JDBC |
+| Data | PostgreSQL 16, Flyway |
+| Security | Spring Security, HTTP Basic, PBKDF2 password hashing |
+| Testing | JUnit 5, MockMvc, Testcontainers, jqwik |
+| Observability | Spring Boot Actuator, Micrometer |
+| Delivery | Maven, Docker, Docker Compose, GitHub Actions, GHCR |
 
 ## Run locally
 
-Start only the database:
+### Prerequisites
+
+- Java 21 JDK
+- Maven 3.6.3 or newer
+- Docker with Compose v2
+- `jq` for the command-line walkthrough below
+
+Start PostgreSQL and the application:
 
 ```bash
 docker compose up -d postgres
 mvn spring-boot:run
 ```
 
-The API listens on `http://localhost:8080`. Health is available at
-`/actuator/health`.
+The API is available at `http://localhost:8080`; health is available at
+`http://localhost:8080/actuator/health`. Flyway applies the schema migrations during startup.
 
-Local demonstration users are `customer`, `operator`, `auditor` and `admin`; each default
-password is `<username>-local`. Override every credential through the `AURUM_*_USERNAME` and
-`AURUM_*_PASSWORD` environment variables before using a shared environment.
+The local configuration creates four bootstrap users:
 
-Run all tests:
+| Username | Password | Role |
+|---|---|---|
+| `customer` | `customer-local` | CUSTOMER |
+| `operator` | `operator-local` | OPERATOR |
+| `auditor` | `auditor-local` | AUDITOR |
+| `admin` | `admin-local` | ADMIN |
 
-```bash
-mvn verify
-```
+These credentials are for local use. Configure different usernames and passwords through the
+`AURUM_*_USERNAME` and `AURUM_*_PASSWORD` environment variables for a shared environment.
 
-The tests start `postgres:16-alpine` automatically and do not require the Compose
-database to be running.
+## API walkthrough
 
-## Documentation
-
-- [Documentation index](docs/README.md)
-- [Architecture and accounting model](docs/architecture.md)
-- [REST API and error contract](docs/api.md)
-- [Reliability, locking, retries and projection rebuilds](docs/reliability.md)
-- [Testing strategy](docs/testing.md)
-- [Metrics and observability](docs/observability.md)
-- [Authentication and RBAC](docs/security.md)
-- [SQL benchmark and query-plan analysis](docs/benchmarking.md)
-- [Scheduled reconciliation and run reports](docs/reconciliation.md)
-
-## Quick demonstration
-
-Create two accounts:
+Create two INR accounts owned by the bootstrap customer:
 
 ```bash
 alice=$(curl -fsS -X POST localhost:8080/api/v1/accounts \
   -u operator:operator-local \
   -H 'Content-Type: application/json' \
-  -d '{"ownerName":"Alice","currency":"INR"}' | jq -r .id)
+  -d '{"ownerName":"Alice","ownerUsername":"customer","currency":"INR"}' | jq -r .id)
 
 bob=$(curl -fsS -X POST localhost:8080/api/v1/accounts \
   -u operator:operator-local \
   -H 'Content-Type: application/json' \
-  -d '{"ownerName":"Bob","currency":"INR"}' | jq -r .id)
+  -d '{"ownerName":"Bob","ownerUsername":"customer","currency":"INR"}' | jq -r .id)
 ```
 
 Fund Alice with INR 1,000.00:
@@ -88,70 +106,97 @@ curl -fsS -X POST "localhost:8080/api/v1/accounts/$alice/fund" \
   -u operator:operator-local \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: fund-alice-001' \
-  -d '{"amountMinor":100000,"currency":"INR","reference":"demo funding"}'
+  -d '{"amountMinor":100000,"currency":"INR","reference":"initial funding"}'
 ```
 
-Transfer INR 250.00 to Bob:
+Transfer INR 250.00 from Alice to Bob:
 
 ```bash
 curl -fsS -X POST localhost:8080/api/v1/transfers \
   -u customer:customer-local \
   -H 'Content-Type: application/json' \
-  -H 'Idempotency-Key: transfer-demo-001' \
-  -d "{\"sourceAccountId\":\"$alice\",\"destinationAccountId\":\"$bob\",\"amountMinor\":25000,\"currency\":\"INR\",\"reference\":\"demo transfer\"}"
+  -H 'Idempotency-Key: transfer-alice-bob-001' \
+  -d "{\"sourceAccountId\":\"$alice\",\"destinationAccountId\":\"$bob\",\"amountMinor\":25000,\"currency\":\"INR\",\"reference\":\"account transfer\"}"
 ```
 
-Withdraw INR 100.00 from Bob:
+Read both balances and verify the projections against the ledger:
 
 ```bash
-curl -fsS -X POST "localhost:8080/api/v1/accounts/$bob/withdraw" \
-  -u customer:customer-local \
-  -H 'Content-Type: application/json' \
-  -H 'Idempotency-Key: withdraw-bob-001' \
-  -d '{"amountMinor":10000,"currency":"INR","reference":"demo withdrawal"}'
+curl -fsS -u customer:customer-local \
+  "localhost:8080/api/v1/accounts/$alice/balance"
+curl -fsS -u customer:customer-local \
+  "localhost:8080/api/v1/accounts/$bob/balance"
+curl -fsS -u auditor:auditor-local \
+  localhost:8080/api/v1/reconciliation
 ```
 
-Repeating the exact transfer request with the same key returns the original transaction
-and does not move money again. Reusing the key with a different payload returns HTTP 409.
+Sending the same transfer again with the same key and payload returns the original transaction.
+Changing the payload while reusing the key returns HTTP 409.
 
-Useful reads:
+## API overview
 
-```text
-GET /api/v1/accounts/{accountId}
-GET /api/v1/accounts/{accountId}/balance
-GET /api/v1/accounts/{accountId}/transactions?limit=20&before={transactionId}
-GET /api/v1/transactions/{transactionId}
-GET /api/v1/reconciliation
-GET /api/v1/reconciliation/runs?limit=20
-POST /api/v1/reconciliation/rebuild
+| Area | Operations |
+|---|---|
+| Accounts | Create, read balance, freeze, unfreeze and close |
+| Ledger | Fund, withdraw, transfer, reverse and read history |
+| Reconciliation | Compare projections, inspect run reports and rebuild projections |
+| Administration | Create users, change roles and read audit events |
+| Operations | Health, application info and Micrometer metrics |
+
+See the [REST API guide](docs/api.md) for request fields, access rules and error codes.
+
+## Tests and benchmarks
+
+Run the standard verification suite:
+
+```bash
+mvn verify
 ```
 
-Mutation endpoints:
+The suite starts PostgreSQL 16 through Testcontainers and covers the application through real SQL
+and HTTP paths. The two larger benchmarks run separately:
 
-```text
-PATCH /api/v1/accounts/{accountId}/freeze
-PATCH /api/v1/accounts/{accountId}/unfreeze
-POST  /api/v1/transactions/{transactionId}/reversal
+```bash
+mvn -Dtest=SqlBenchmark test
+mvn -Dtest=HttpLoadBenchmark test
 ```
 
-## Accounting model
+The SQL harness builds a 100,000-transaction fixture and captures `EXPLAIN ANALYZE` plans. Its
+reference optimization run reduced median hot-account history latency from 145.875 ms to 1.401 ms.
+Benchmark method and context are documented in [SQL benchmarking](docs/benchmarking.md) and
+[HTTP load testing](docs/load-testing.md).
 
-Customer accounts are liabilities with a normal credit balance. Aurum seeds one debit-normal
-settlement asset account for INR and USD. Funding debits settlement and credits the customer;
-a transfer debits the source customer and credits the destination customer; a withdrawal
-debits the customer and credits settlement.
+## Container image
 
-`account_balance` is a transactionally updated projection. `ledger_entry` remains the source
-of truth. `GET /api/v1/reconciliation` recomputes balances and reports any mismatch.
-The internal/demo rebuild endpoint repairs mismatched projections while holding deterministic
-account locks; see the [reliability guide](docs/reliability.md) before exposing it.
+Build the application and local image:
 
-## Storage hygiene
+```bash
+mvn verify
+docker build -t aurum:local .
+```
 
-The source tree is tiny. Generated classes and the executable JAR live under ignored `target/`.
-Remove them with `mvn clean`. Compose creates one named database volume; remove only this
-project's containers and data with `docker compose down --volumes`. Both development and tests
-reuse `postgres:16-alpine`, avoiding a duplicate PostgreSQL image.
+The image runs the Java process as user `10001` and expects PostgreSQL connection settings through
+environment variables. Pushing a version tag such as `v1.0.0`, or manually starting the publish
+workflow, builds and publishes `ghcr.io/<owner>/<repository>` with provenance and an SBOM.
 
-The database and HTTP Basic credentials documented here are development-only. See the
-[security guide](docs/security.md) for the permission matrix and production limitations.
+## Documentation
+
+- [Architecture and accounting model](docs/architecture.md)
+- [REST API](docs/api.md)
+- [Reliability and failure recovery](docs/reliability.md)
+- [Authentication and authorization](docs/security.md)
+- [Audit events](docs/audit.md)
+- [Reconciliation](docs/reconciliation.md)
+- [Metrics and observability](docs/observability.md)
+- [Testing strategy](docs/testing.md)
+- [SQL benchmarking](docs/benchmarking.md)
+- [HTTP load testing](docs/load-testing.md)
+- [Operations and delivery](docs/operations.md)
+
+The [documentation index](docs/README.md) provides a guided reading order.
+
+## Storage cleanup
+
+Generated classes, reports and JAR files are written under the ignored `target/` directory. Remove
+them with `mvn clean`. Stop the local database with `docker compose down`; add `--volumes` only when
+you also want to delete the local Aurum database.

@@ -1,60 +1,88 @@
 # Architecture and accounting
 
-## Scope
+## System overview
 
-Aurum is a modular Spring Boot monolith. PostgreSQL is the authority for concurrency and
-durability; there is no cache, message broker or second datastore. Accounts have one currency,
-and Aurum performs no foreign-exchange conversion.
+Aurum is a modular Spring Boot application backed by PostgreSQL. The API, business logic and data
+access code run in one process, while PostgreSQL provides durable storage, transactions, row locks
+and integrity constraints. Flyway owns every schema change.
 
-## Modules
+Accounts hold one currency. The current schema provides INR and USD settlement accounts and does
+not perform foreign-exchange conversion.
+
+## Application modules
 
 | Package | Responsibility |
 |---|---|
-| `account` | Account creation, status changes, balance reads and row locking |
-| `ledger` | Money operations, balanced posting, immutable entries and history |
-| `idempotency` | Atomic request claims, request-hash comparison and replay lookup |
-| `reconciliation` | Ledger-to-projection comparison and controlled rebuilding |
-| `observability` | Fixed-cardinality business metrics |
-| `security` | Stateless authentication, endpoint RBAC and security error responses |
-| `common` | Stable API errors, hashing and PostgreSQL retry classification |
+| `account` | Customer accounts, ownership, lifecycle state, balances and row locks |
+| `ledger` | Funding, withdrawals, transfers, reversals and transaction history |
+| `idempotency` | Request claims, payload hashes and stored-result replay |
+| `reconciliation` | Ledger-derived balance checks, run reports and projection repair |
+| `security` | Users, password hashing, authentication, roles and resource ownership |
+| `audit` | Actor-attributed records for sensitive operations |
+| `observability` | Transfer, retry, idempotency and reconciliation metrics |
+| `reliability` | Controlled failure points used by integration tests |
+| `common` | API errors, request hashing and PostgreSQL retry classification |
 
-Controllers translate HTTP contracts into service calls. Only the posting service creates ledger
-transactions and entries. Repository code owns SQL, while Flyway owns the schema and database
-integrity triggers.
+Controllers validate HTTP input and apply resource-level authorization. Services define the
+transaction boundaries and business rules. Repositories contain SQL. The posting service is the
+only application component that inserts ledger transactions and entries.
 
-## Accounting model
+## Double-entry model
 
 Customer accounts are credit-normal liabilities. Settlement accounts are debit-normal assets.
-Every operation posts equal positive debit and credit amounts in one currency.
+Every operation creates equal positive debit and credit amounts in one currency.
 
 | Operation | Debit | Credit |
 |---|---|---|
-| Funding | Settlement | Customer |
-| Withdrawal | Customer | Settlement |
-| Transfer | Source customer | Destination customer |
-| Reversal | Opposite of each original entry | Opposite of each original entry |
+| Funding | Settlement account | Customer account |
+| Withdrawal | Customer account | Settlement account |
+| Transfer | Source customer account | Destination customer account |
+| Reversal | Opposite side of each original entry | Opposite side of each original entry |
 
-Amounts are signed only by accounting direction. The stored `amount_minor` is always positive;
-INR `2500` represents INR 25.00. Floating point is never used.
+`amount_minor` stores integer minor units and is always positive. Entry direction determines
+whether the amount increases or decreases an account according to its normal side. Floating-point
+arithmetic is not used for money.
 
-## Source of truth and projection
+## Source of truth and balance projection
 
-`ledger_transaction` and `ledger_entry` are append-only. PostgreSQL triggers reject updates and
-deletes, and a deferred constraint trigger rejects transactions that are not balanced at commit.
+`ledger_transaction` and `ledger_entry` are the financial source of truth. PostgreSQL triggers
+reject updates and deletes, and a deferred constraint trigger verifies at commit that each new
+transaction:
 
-`account_balance` is a lockable, transactionally maintained projection used for fast reads and
-funds checks. It can be independently recomputed from immutable entries. A projection mismatch is
-therefore detectable and repairable without rewriting financial history.
+- contains at least two entries;
+- uses one currency;
+- has equal debit and credit totals.
 
-## Money-operation flow
+`account_balance` stores the current projected balance for fast reads and funds checks. The same
+database transaction writes the immutable entries and updates the projection. Reconciliation can
+independently recompute every balance from the ledger, detect a difference and repair only the
+projection without changing financial history.
 
-1. Validate and normalize the request.
-2. Claim the scoped idempotency key.
+## Identity, ownership and audit data
+
+Each customer account references a durable `app_user` with the CUSTOMER role. CUSTOMER requests
+can read their own accounts and transactions that touch those accounts. A withdrawal or transfer
+also requires ownership of the source account. Settlement accounts have no user owner.
+
+Account states are ACTIVE, FROZEN and CLOSED. A frozen account can receive money but cannot send or
+withdraw it. Closing requires a locked zero balance, is irreversible and prevents later postings
+that involve the account.
+
+`audit_event` stores the actor, action, target, correlation value and timestamp for successful
+security-sensitive operations. Audit insertion shares the business transaction, so rolled-back
+operations do not leave success records. Database triggers reject audit updates and deletes.
+
+## Posting transaction
+
+Each money request follows the same path:
+
+1. Validate the amount, currency, account identifiers and reference.
+2. Claim the scoped idempotency key and compare the request hash.
 3. Lock every affected account and balance row in UUID order.
-4. Validate account type, state, currency and available funds.
-5. Insert one transaction and its balanced entries.
-6. Update all affected balance projections.
-7. Attach the transaction ID to the idempotency claim.
+4. Check account type, state, currency and available funds.
+5. Insert the transaction header and balanced ledger entries.
+6. Update the affected balance projections.
+7. Complete the idempotency record and append the audit event.
 8. Commit once and return the stored transaction.
 
-All database changes in steps 2–7 share one PostgreSQL transaction.
+A failure before commit rolls back every database change from this sequence.

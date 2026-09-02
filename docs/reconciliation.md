@@ -2,61 +2,61 @@
 
 ## Purpose
 
-Reconciliation independently derives account balances from immutable ledger entries and compares
-them with the fast `account_balance` projection. The live endpoint remains available, while the
-scheduled job creates durable evidence that the check ran and records every mismatch it observed.
+The ledger is the financial source of truth, while `account_balance` provides fast balance reads.
+Reconciliation derives each balance from immutable ledger entries and compares it with the stored
+projection. This verifies that projection updates remain consistent with financial history.
 
-## Schedule
+## Schedule and configuration
 
-The job runs hourly in UTC by default. Configure it without rebuilding the application:
+The scheduled check runs hourly in UTC by default:
 
-| Environment variable | Default | Purpose |
+| Environment variable | Default | Description |
 |---|---|---|
-| `RECONCILIATION_SCHEDULE_ENABLED` | `true` | Enable or disable the clock-driven trigger |
+| `RECONCILIATION_SCHEDULE_ENABLED` | `true` | Enables the scheduled trigger |
 | `RECONCILIATION_SCHEDULE_CRON` | `0 0 * * * *` | Spring six-field cron expression |
-| `RECONCILIATION_SCHEDULE_ZONE` | `UTC` | Time zone used to interpret the cron expression |
+| `RECONCILIATION_SCHEDULE_ZONE` | `UTC` | Time zone used for the cron expression |
 
-The trigger delegates to `ReconciliationJob`, so deterministic tests and future operator tooling
-can execute exactly the same path without waiting for the clock.
+The scheduler calls the same `ReconciliationJob` used by integration tests, keeping scheduling,
+metrics and persistence behavior on one execution path.
 
-## Cross-instance coordination
+## Coordination across instances
 
-Each attempt starts a PostgreSQL transaction and calls `pg_try_advisory_xact_lock` with Aurum's
-fixed reconciliation lock key. One application instance acquires the lock; simultaneous attempts
-on other instances return immediately as `skipped`. PostgreSQL releases the lock automatically at
-transaction end, including rollback or connection failure, so no cleanup lease is required.
+Every scheduled attempt opens a transaction and calls `pg_try_advisory_xact_lock` with Aurum's
+fixed reconciliation lock key. One application instance acquires the lock. Other instances record
+a `skipped` metric and return without running a duplicate scan.
 
-This coordinates Aurum instances that share the same database. It intentionally does not block the
-live read-only endpoint or the operator-controlled projection rebuild.
+PostgreSQL releases the transaction-scoped lock at commit or rollback, including connection
+failure. The lock coordinates instances connected to the same database and does not block the live
+read endpoint or the operator-controlled projection rebuild.
 
-## Durable reports
+## Immutable run reports
 
-An executed check appends one `reconciliation_run` row and zero or more
-`reconciliation_run_mismatch` rows in the same transaction. Database triggers reject updates and
-deletes from both tables. A report contains:
+An executed check stores one `reconciliation_run` row and any mismatch details in the same
+transaction. A report contains:
 
-- consistent or mismatched status;
-- number of accounts scanned and mismatches found;
+- CONSISTENT or MISMATCHED status;
+- the number of accounts scanned and mismatches found;
 - start and completion timestamps;
-- each affected account, currency, projected balance and ledger-derived balance.
+- account ID, currency, projected balance and ledger-derived balance for each mismatch.
 
-Read the newest reports with an AUDITOR, OPERATOR or ADMIN identity:
+Database triggers reject updates and deletes on both reconciliation report tables.
+
+OPERATOR, AUDITOR and ADMIN users can read recent reports:
 
 ```bash
 curl -fsS -u auditor:auditor-local \
   'localhost:8080/api/v1/reconciliation/runs?limit=20'
 ```
 
-The endpoint accepts a limit from 1 through 50. Reports diagnose inconsistencies but never repair
-them. An OPERATOR or ADMIN must separately invoke `POST /api/v1/reconciliation/rebuild` after
-investigating the cause.
+`limit` accepts values from 1 through 50. Reports diagnose differences but do not repair them.
+OPERATOR and ADMIN users can run `POST /api/v1/reconciliation/rebuild` after reviewing the result.
+The rebuild locks affected data, repairs the projection and creates an audit event.
 
-The hourly default appends 8,760 summary rows per year, plus detail rows only when mismatches exist.
-No automatic purge is performed because the reports are audit evidence. For a long-lived local
-database, reduce the frequency or disable scheduling when continuous evidence is unnecessary.
+## Metrics and failures
 
-## Failure visibility
+Each attempt records its duration and one bounded outcome: `consistent`, `mismatched`, `skipped` or
+`error`. Completed runs update the last-known mismatch gauge. An exception is logged, counted and
+allowed to roll back the report transaction; the scheduler remains active for the next run.
 
-Every attempt records a bounded outcome and duration metric. Completed runs update the last-known
-mismatch gauge. Failures are logged and counted as `error`; lock contention is counted as
-`skipped`. A database failure rolls back the report, so a stored run is always complete.
+Run reports have no automatic purge. At the hourly default, a continuously running instance writes
+8,760 summary rows per year, plus detail rows for detected mismatches.

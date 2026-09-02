@@ -13,20 +13,24 @@ import org.springframework.http.ProblemDetail;
 import org.springframework.security.config.Customizer;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.http.SessionCreationPolicy;
-import org.springframework.security.core.userdetails.User;
 import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.core.userdetails.UsernameNotFoundException;
 import org.springframework.security.crypto.password.PasswordEncoder;
-import org.springframework.security.crypto.password.Pbkdf2PasswordEncoder;
-import org.springframework.security.provisioning.InMemoryUserDetailsManager;
 import org.springframework.security.web.SecurityFilterChain;
 
 import java.io.IOException;
 import java.net.URI;
 import java.time.Instant;
+import java.util.UUID;
 
 @Configuration
 @ConditionalOnWebApplication(type = ConditionalOnWebApplication.Type.SERVLET)
 public class SecurityConfiguration {
+
+    private static final UUID CUSTOMER_ID = UUID.fromString("00000000-0000-0000-0000-000000000101");
+    private static final UUID OPERATOR_ID = UUID.fromString("00000000-0000-0000-0000-000000000102");
+    private static final UUID AUDITOR_ID = UUID.fromString("00000000-0000-0000-0000-000000000103");
+    private static final UUID ADMIN_ID = UUID.fromString("00000000-0000-0000-0000-000000000104");
 
     private static final String CUSTOMER = "CUSTOMER";
     private static final String OPERATOR = "OPERATOR";
@@ -51,13 +55,20 @@ public class SecurityConfiguration {
                             .permitAll()
                         .requestMatchers("/actuator/metrics", "/actuator/metrics/**")
                             .hasAnyRole(AUDITOR, OPERATOR, ADMIN)
+                        .requestMatchers(HttpMethod.GET, "/api/v1/audit-events", "/api/v1/audit-events/**")
+                            .hasAnyRole(AUDITOR, ADMIN)
+                        .requestMatchers(HttpMethod.GET, "/api/v1/users", "/api/v1/users/**")
+                            .hasAnyRole(AUDITOR, ADMIN)
+                        .requestMatchers("/api/v1/users", "/api/v1/users/**")
+                            .hasRole(ADMIN)
                         .requestMatchers(HttpMethod.POST, "/api/v1/reconciliation/rebuild")
                             .hasAnyRole(OPERATOR, ADMIN)
                         .requestMatchers(HttpMethod.GET,
                                 "/api/v1/reconciliation", "/api/v1/reconciliation/**")
                             .hasAnyRole(AUDITOR, OPERATOR, ADMIN)
                         .requestMatchers(HttpMethod.PATCH,
-                                "/api/v1/accounts/*/freeze", "/api/v1/accounts/*/unfreeze")
+                                "/api/v1/accounts/*/freeze", "/api/v1/accounts/*/unfreeze",
+                                "/api/v1/accounts/*/close")
                             .hasAnyRole(OPERATOR, ADMIN)
                         .requestMatchers(HttpMethod.POST, "/api/v1/accounts")
                             .hasAnyRole(OPERATOR, ADMIN)
@@ -84,13 +95,9 @@ public class SecurityConfiguration {
     }
 
     @Bean
-    PasswordEncoder passwordEncoder() {
-        return Pbkdf2PasswordEncoder.defaultsForSpringSecurity_v5_8();
-    }
-
-    @Bean
     UserDetailsService users(
             PasswordEncoder encoder,
+            AppUserRepository users,
             @Value("${aurum.security.users.customer.username:customer}") String customerUsername,
             @Value("${aurum.security.users.customer.password:customer-local}") String customerPassword,
             @Value("${aurum.security.users.operator.username:operator}") String operatorUsername,
@@ -99,11 +106,37 @@ public class SecurityConfiguration {
             @Value("${aurum.security.users.auditor.password:auditor-local}") String auditorPassword,
             @Value("${aurum.security.users.admin.username:admin}") String adminUsername,
             @Value("${aurum.security.users.admin.password:admin-local}") String adminPassword) {
-        return new InMemoryUserDetailsManager(
-                User.withUsername(customerUsername).password(encoder.encode(customerPassword)).roles(CUSTOMER).build(),
-                User.withUsername(operatorUsername).password(encoder.encode(operatorPassword)).roles(OPERATOR).build(),
-                User.withUsername(auditorUsername).password(encoder.encode(auditorPassword)).roles(AUDITOR).build(),
-                User.withUsername(adminUsername).password(encoder.encode(adminPassword)).roles(ADMIN).build());
+        bootstrap(users, encoder, CUSTOMER_ID, customerUsername, customerPassword, UserRole.CUSTOMER);
+        bootstrap(users, encoder, OPERATOR_ID, operatorUsername, operatorPassword, UserRole.OPERATOR);
+        bootstrap(users, encoder, AUDITOR_ID, auditorUsername, auditorPassword, UserRole.AUDITOR);
+        bootstrap(users, encoder, ADMIN_ID, adminUsername, adminPassword, UserRole.ADMIN);
+        return username -> users.findByUsername(username)
+                .map(user -> org.springframework.security.core.userdetails.User
+                        .withUsername(user.username())
+                        .password(user.passwordHash())
+                        .roles(user.role().name())
+                        .disabled(!user.enabled())
+                        .build())
+                .orElseThrow(() -> new UsernameNotFoundException("User was not found"));
+    }
+
+    private void bootstrap(AppUserRepository users, PasswordEncoder encoder, UUID id,
+                           String username, String password, UserRole role) {
+        AppUserView existing = users.findById(id).orElse(null);
+        if (existing != null && existing.username().equals(username)
+                && existing.role() == role && existing.enabled()
+                && passwordMatches(encoder, password, existing.passwordHash())) {
+            return;
+        }
+        users.updateBootstrapIdentity(id, username, encoder.encode(password), role, Instant.now());
+    }
+
+    private boolean passwordMatches(PasswordEncoder encoder, String password, String encoded) {
+        try {
+            return encoder.matches(password, encoded);
+        } catch (IllegalArgumentException exception) {
+            return false;
+        }
     }
 
     private void writeProblem(HttpServletResponse response, HttpStatus status,

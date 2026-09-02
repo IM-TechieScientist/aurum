@@ -1,18 +1,25 @@
 # Aurum documentation
 
-Aurum deliberately keeps operational and design explanations outside the source packages while
-making them directly discoverable from the project README.
+These guides describe Aurum's design, API, correctness guarantees, security model, verification
+strategy and delivery workflow.
 
-- [Architecture](architecture.md) explains module boundaries, double-entry accounting and the
-  persistence model.
-- [API](api.md) documents endpoints, request conventions, responses and stable error codes.
-- [Reliability](reliability.md) covers transactions, locking, idempotency, retries,
-  reconciliation and projection rebuilding.
-- [Testing](testing.md) describes example-based, HTTP, concurrency, database-constraint and
-  property-based verification.
-- [Observability](observability.md) lists the custom metrics, tags and Actuator queries.
-- [Security](security.md) documents authentication, roles, endpoint permissions and limitations.
-- [SQL benchmarking](benchmarking.md) defines the synthetic workload, commands and result format.
-- [Scheduled reconciliation](reconciliation.md) explains coordination, durable reports and configuration.
+## Start here
 
-The root [README](../README.md) remains the quickest path for setup and a runnable demonstration.
+1. [Architecture and accounting](architecture.md) explains the system structure, data model and
+   double-entry rules.
+2. [REST API](api.md) lists endpoints, request rules, authorization and error responses.
+3. [Reliability](reliability.md) covers locking, idempotency, retries, reconciliation and failure
+   recovery.
+4. [Testing](testing.md) shows how each guarantee is verified against PostgreSQL and HTTP.
+
+## Reference guides
+
+- [Authentication and authorization](security.md)
+- [Append-only audit events](audit.md)
+- [Scheduled reconciliation](reconciliation.md)
+- [Metrics and observability](observability.md)
+- [SQL benchmarking](benchmarking.md)
+- [HTTP load testing](load-testing.md)
+- [Operations and delivery](operations.md)
+
+Return to the root [README](../README.md) for setup instructions and a command-line walkthrough.
